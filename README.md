@@ -227,6 +227,6 @@ ALL1n/
 
 ---
 
-**开发团队**：POC Tester Team  
-**联系方式**：security@example.com  
-**项目主页**：https://github.com/yourusername/ALL1n
+**开发团队**：Hacking Group 0434
+**联系方式**：hg0434hongzh0@gmail.com  
+**项目主页**：[https://github.com/yourusername/ALL1n](https://github.com/hg0434hongzh0/ALL1n)
