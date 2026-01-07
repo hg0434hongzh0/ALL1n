@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"image/color"
@@ -282,6 +283,11 @@ func sendExploit(targetBase string, poc *POC, logFunc func(string, string)) {
 
 	client := &http.Client{
 		Timeout: 8 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true, // 跳过证书验证
+			},
+		},
 	}
 
 	logFunc("INFO", fmt.Sprintf("正在测试: %s [%s %s]", poc.Name, poc.Method, poc.Path))
