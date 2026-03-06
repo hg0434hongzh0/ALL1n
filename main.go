@@ -38,7 +38,7 @@ func main() {
 
 	runner := NewRunner()
 	a := app.NewWithID("com.all1n.pocworkbench")
-	w := a.NewWindow("ALL1n - POC 验证工作台")
+	w := a.NewWindow("All1n By hongzh0 - POC 验证工作台")
 	w.Resize(fyne.NewSize(1480, 920))
 
 	targetEntry := widget.NewEntry()
@@ -999,11 +999,12 @@ func main() {
 		),
 	)
 
-	stepToolbar := container.NewGridWithColumns(4,
-		widget.NewForm(widget.NewFormItem("当前步骤", stepSelect)),
-		addStepBtn,
-		duplicateStepBtn,
-		removeStepBtn,
+	stepToolbar := container.NewBorder(
+		nil,
+		nil,
+		widget.NewLabelWithStyle("当前步骤", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		container.NewHBox(addStepBtn, duplicateStepBtn, removeStepBtn),
+		stepSelect,
 	)
 
 	stepForm := widget.NewForm(
@@ -1020,16 +1021,20 @@ func main() {
 		widget.NewFormItem("步骤策略", continueCheck),
 	)
 
+	editorContent := container.NewVBox(
+		selectedLabel,
+		stepToolbar,
+		widget.NewSeparator(),
+		stepForm,
+		container.NewHBox(layout.NewSpacer(), saveBtn),
+	)
+	editorScroll := container.NewVScroll(editorContent)
+	editorScroll.SetMinSize(fyne.NewSize(0, 420))
+
 	editorCard := widget.NewCard(
 		"链式 POC 编辑器",
 		"支持多步骤请求、变量提取与占位符替换",
-		container.NewVBox(
-			selectedLabel,
-			stepToolbar,
-			widget.NewSeparator(),
-			stepForm,
-			container.NewHBox(layout.NewSpacer(), saveBtn),
-		),
+		editorScroll,
 	)
 
 	summaryGrid := container.NewGridWithColumns(
@@ -1053,23 +1058,36 @@ func main() {
 	)
 
 	rightPanel := container.NewVSplit(container.NewPadded(editorCard), container.NewPadded(logCard))
-	rightPanel.SetOffset(0.60)
+	rightPanel.SetOffset(0.66)
 
 	mainSplit := container.NewHSplit(container.NewPadded(leftCard), container.NewPadded(rightPanel))
 	mainSplit.SetOffset(0.28)
 
+	targetRow := container.NewBorder(
+		nil,
+		nil,
+		widget.NewLabelWithStyle("目标地址", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		nil,
+		targetEntry,
+	)
+
+	runtimeOptionsRow := container.NewHBox(
+		widget.NewLabel("超时(秒)"),
+		container.NewGridWrap(fyne.NewSize(90, timeoutEntry.MinSize().Height), timeoutEntry),
+		widget.NewLabel("批量并发"),
+		container.NewGridWrap(fyne.NewSize(120, concurrencySelect.MinSize().Height), concurrencySelect),
+		insecureTLSCheck,
+		layout.NewSpacer(),
+		singleTestBtn,
+		batchTestBtn,
+	)
+
 	topCard := widget.NewCard(
-		"目标与运行选项",
-		"支持超时、TLS、批量并发和链式请求验证",
+		"All1n By hongzh0",
+		"支持树管理、TLS、批量并发和链式请求验证",
 		container.NewVBox(
-			targetEntry,
-			container.NewGridWithColumns(
-				4,
-				widget.NewForm(widget.NewFormItem("超时(秒)", timeoutEntry)),
-				widget.NewForm(widget.NewFormItem("批量并发", concurrencySelect)),
-				container.NewCenter(insecureTLSCheck),
-				container.NewGridWithColumns(2, singleTestBtn, batchTestBtn),
-			),
+			targetRow,
+			runtimeOptionsRow,
 		),
 	)
 
