@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,7 +44,7 @@ func main() {
 	w.Resize(fyne.NewSize(1480, 920))
 
 	targetEntry := widget.NewEntry()
-	targetEntry.SetPlaceHolder("目标地址，例如 http://192.168.1.10:8080")
+	targetEntry.SetPlaceHolder("目标地址，支持单个或批量（换行/逗号/分号分隔）")
 
 	timeoutEntry := widget.NewEntry()
 	timeoutEntry.SetText("10")
@@ -183,6 +185,7 @@ func main() {
 	})
 	singleTestBtn := widget.NewButtonWithIcon("单点验证", theme.MediaPlayIcon(), nil)
 	batchTestBtn := widget.NewButtonWithIcon("批量验证", theme.MediaSkipNextIcon(), nil)
+	importTargetsBtn := widget.NewButtonWithIcon("导入目标", theme.UploadIcon(), nil)
 
 	addStepBtn := widget.NewButtonWithIcon("新增步骤", theme.ContentAddIcon(), nil)
 	duplicateStepBtn := widget.NewButtonWithIcon("复制步骤", theme.ContentCopyIcon(), nil)
@@ -830,6 +833,86 @@ func main() {
 		openDialog.Show()
 	})
 
+	importNucleiDirBtn := widget.NewButtonWithIcon("批量导入 Nuclei 目录", theme.FolderOpenIcon(), func() {
+		if isRunning {
+			appendLogUI("INFO", "当前正在执行验证，请等待完成后再导入模板")
+			return
+		}
+
+		pathEntry := widget.NewEntry()
+		pathEntry.SetPlaceHolder("输入 Nuclei 模板目录绝对路径，例如 /home/user/nuclei-templates")
+
+		dialog.NewCustomConfirm("批量导入 Nuclei 模板目录", "导入", "取消", pathEntry, func(ok bool) {
+			if !ok {
+				return
+			}
+			dir := strings.TrimSpace(pathEntry.Text)
+			if dir == "" {
+				dialog.ShowInformation("提示", "目录路径不能为空", w)
+				return
+			}
+			stat, err := os.Stat(dir)
+			if err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			if !stat.IsDir() {
+				dialog.ShowInformation("提示", "输入路径不是文件夹", w)
+				return
+			}
+
+			folderName, importedPOCs, err := importNucleiTemplatesFromDir(dir)
+			if err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			if err := appendImportedPOCs(resolveImportParentID(), folderName, importedPOCs); err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			_ = persistData(fmt.Sprintf("已批量导入 Nuclei 模板目录，共 %d 个 POC", len(importedPOCs)))
+		}, w).Show()
+	})
+
+	importTargetsBtn.OnTapped = func() {
+		if isRunning {
+			appendLogUI("INFO", "当前正在执行验证，请等待完成后再导入目标")
+			return
+		}
+
+		openDialog := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
+			if err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			if reader == nil {
+				return
+			}
+			defer reader.Close()
+
+			path := ""
+			if reader.URI() != nil {
+				path = reader.URI().Path()
+			}
+			if path == "" {
+				dialog.ShowInformation("提示", "无法读取目标文件路径", w)
+				return
+			}
+
+			targets, err := loadTargetsFromFile(path)
+			if err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+
+			targetEntry.SetText(strings.Join(targets, "\n"))
+			appendLogUI("INFO", fmt.Sprintf("已导入目标 %d 条：%s", len(targets), filepath.Base(path)))
+			statusLabel.SetText(fmt.Sprintf("目标导入完成，共 %d 条", len(targets)))
+		}, w)
+		openDialog.SetFilter(storage.NewExtensionFileFilter([]string{".txt", ".csv", ".list", ".md"}))
+		openDialog.Show()
+	}
+
 	saveBtn.OnTapped = func() {
 		if currentSelectedID == "" {
 			dialog.ShowInformation("提示", "请先选择一个节点", w)
@@ -875,10 +958,14 @@ func main() {
 			return
 		}
 
-		targetBase := strings.TrimSpace(targetEntry.Text)
-		if targetBase == "" {
+		targets := parseTargets(targetEntry.Text)
+		if len(targets) == 0 {
 			appendLogUI("ERR", "请输入目标地址")
 			return
+		}
+		targetBase := targets[0]
+		if len(targets) > 1 {
+			appendLogUI("INFO", fmt.Sprintf("检测到 %d 个目标，单点验证仅使用第一条：%s", len(targets), targetBase))
 		}
 		poc := selectedPOC()
 		if poc == nil {
@@ -914,8 +1001,8 @@ func main() {
 			return
 		}
 
-		targetBase := strings.TrimSpace(targetEntry.Text)
-		if targetBase == "" {
+		targetList := parseTargets(targetEntry.Text)
+		if len(targetList) == 0 {
 			appendLogUI("ERR", "请输入目标地址")
 			return
 		}
@@ -941,12 +1028,17 @@ func main() {
 			return
 		}
 
-		appendLogUI("INFO", fmt.Sprintf("=== 开始批量验证：%s，共 %d 条，%d 并发 ===", scopeName, len(targets), concurrency))
-		startRunUI(len(targets), fmt.Sprintf("批量验证进行中（%d 条）", len(targets)))
+		totalJobs := len(targets) * len(targetList)
+		appendLogUI("INFO", fmt.Sprintf("=== 开始批量验证：%s，POC %d 条 × 目标 %d 条，共 %d 任务，%d 并发 ===", scopeName, len(targets), len(targetList), totalJobs, concurrency))
+		startRunUI(totalJobs, fmt.Sprintf("批量验证进行中（%d 任务）", totalJobs))
 
 		go func() {
-			workerCount := minInt(concurrency, len(targets))
-			jobs := make(chan *POC)
+			workerCount := minInt(concurrency, totalJobs)
+			type batchJob struct {
+				target string
+				poc    *POC
+			}
+			jobs := make(chan batchJob)
 			results := make(chan ExploitResult)
 			var wg sync.WaitGroup
 
@@ -954,15 +1046,17 @@ func main() {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					for poc := range jobs {
-						results <- runner.Run(targetBase, poc, settings)
+					for job := range jobs {
+						results <- runner.Run(job.target, job.poc, settings)
 					}
 				}()
 			}
 
 			go func() {
-				for _, poc := range targets {
-					jobs <- poc
+				for _, target := range targetList {
+					for _, poc := range targets {
+						jobs <- batchJob{target: target, poc: poc}
+					}
 				}
 				close(jobs)
 				wg.Wait()
@@ -985,14 +1079,15 @@ func main() {
 	}
 
 	toolBar := container.NewGridWithColumns(3, addFolderBtn, addPOCBtn, deleteBtn)
-	dataBar := container.NewGridWithColumns(3, exportBtn, importJSONBtn, importNucleiBtn)
+	dataBar := container.NewGridWithColumns(2, exportBtn, importJSONBtn)
+	nucleiBar := container.NewGridWithColumns(2, importNucleiBtn, importNucleiDirBtn)
 
 	leftCard := widget.NewCard(
 		"POC 目录",
 		"支持名称筛选与 Nuclei 模板导入",
 		container.NewBorder(
 			container.NewVBox(filterEntry, toolBar, widget.NewSeparator()),
-			container.NewVBox(widget.NewSeparator(), dataBar),
+			container.NewVBox(widget.NewSeparator(), dataBar, nucleiBar),
 			nil,
 			nil,
 			container.NewPadded(tree),
@@ -1067,7 +1162,7 @@ func main() {
 		nil,
 		nil,
 		widget.NewLabelWithStyle("目标地址", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		nil,
+		importTargetsBtn,
 		targetEntry,
 	)
 
