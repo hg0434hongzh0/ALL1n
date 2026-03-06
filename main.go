@@ -39,7 +39,7 @@ func main() {
 	runner := NewRunner()
 	a := app.NewWithID("com.all1n.pocworkbench")
 	w := a.NewWindow("ALL1n - POC 验证工作台")
-	w.Resize(fyne.NewSize(1360, 860))
+	w.Resize(fyne.NewSize(1480, 920))
 
 	targetEntry := widget.NewEntry()
 	targetEntry.SetPlaceHolder("目标地址，例如 http://192.168.1.10:8080")
@@ -70,9 +70,9 @@ func main() {
 
 	richLog := widget.NewRichText()
 	logScroll := container.NewVScroll(richLog)
-	logScroll.SetMinSize(fyne.NewSize(0, 240))
+	logScroll.SetMinSize(fyne.NewSize(0, 250))
 
-	const maxLogEntries = 400
+	const maxLogEntries = 500
 	logEntries := make([]logEntry, 0, maxLogEntries)
 
 	refreshLog := func() {
@@ -86,6 +86,8 @@ func main() {
 				colorName = theme.ColorNameError
 			case "INFO":
 				colorName = theme.ColorNamePrimary
+			case "SAFE":
+				colorName = theme.ColorNameWarning
 			}
 
 			segments = append(segments,
@@ -124,7 +126,6 @@ func main() {
 		doneValue.SetText(strconv.Itoa(summary.Done))
 		vulnValue.SetText(strconv.Itoa(summary.Vuln))
 		errValue.SetText(strconv.Itoa(summary.Err))
-
 		if summary.Total == 0 {
 			progressBar.SetValue(0)
 			return
@@ -135,13 +136,16 @@ func main() {
 	currentSummary := runSummary{}
 	isRunning := false
 
-	nameEntry := widget.NewEntry()
-	nameEntry.SetPlaceHolder("节点名称")
+	nodeNameEntry := widget.NewEntry()
+	nodeNameEntry.SetPlaceHolder("节点名称")
+
+	stepSelect := widget.NewSelect(nil, nil)
+	stepNameEntry := widget.NewEntry()
+	stepNameEntry.SetPlaceHolder("步骤名称")
 
 	methodSelect := widget.NewSelect([]string{"GET", "POST", "PUT", "DELETE", "PATCH"}, nil)
 	pathEntry := widget.NewEntry()
-	pathEntry.SetPlaceHolder("/api/v1/login")
-
+	pathEntry.SetPlaceHolder("/api/v1/login 或 {{BaseURL}}/api/v1/login")
 	paramsEntry := widget.NewEntry()
 	paramsEntry.SetPlaceHolder("id=1&debug=true")
 
@@ -161,7 +165,15 @@ func main() {
 	headersScroll.SetMinSize(fyne.NewSize(0, 100))
 
 	matchEntry := widget.NewEntry()
-	matchEntry.SetPlaceHolder("支持纯文本，或 body:/status:/header:/regex:，可用 && 组合")
+	matchEntry.SetPlaceHolder("支持 body:/status:/header:/headers:/regex:/!/&&/||")
+
+	extractEntry := widget.NewMultiLineEntry()
+	extractEntry.SetPlaceHolder("token=body_regex:token=([a-z0-9]+)\nsid=header:Set-Cookie")
+	extractEntry.Wrapping = fyne.TextWrapWord
+	extractScroll := container.NewScroll(extractEntry)
+	extractScroll.SetMinSize(fyne.NewSize(0, 80))
+
+	continueCheck := widget.NewCheck("步骤失败或未命中后继续后续步骤", nil)
 
 	saveBtn := widget.NewButtonWithIcon("保存节点", theme.DocumentSaveIcon(), nil)
 	clearLogBtn := widget.NewButtonWithIcon("清空日志", theme.DeleteIcon(), func() {
@@ -172,12 +184,21 @@ func main() {
 	singleTestBtn := widget.NewButtonWithIcon("单点验证", theme.MediaPlayIcon(), nil)
 	batchTestBtn := widget.NewButtonWithIcon("批量验证", theme.MediaSkipNextIcon(), nil)
 
+	addStepBtn := widget.NewButtonWithIcon("新增步骤", theme.ContentAddIcon(), nil)
+	duplicateStepBtn := widget.NewButtonWithIcon("复制步骤", theme.ContentCopyIcon(), nil)
+	removeStepBtn := widget.NewButtonWithIcon("删除步骤", theme.DeleteIcon(), nil)
+
 	var currentSelectedID string
+	currentStepIndex := -1
+	stepSelectionGuard := false
+
 	filterEntry := widget.NewEntry()
 	filterEntry.SetPlaceHolder("筛选 POC / 文件夹")
 
-	setPOCFieldsEnabled := func(enabled bool) {
+	setStepFieldsEnabled := func(enabled bool) {
 		if enabled {
+			stepSelect.Enable()
+			stepNameEntry.Enable()
 			methodSelect.Enable()
 			pathEntry.Enable()
 			paramsEntry.Enable()
@@ -185,9 +206,16 @@ func main() {
 			bodyEntry.Enable()
 			headersEntry.Enable()
 			matchEntry.Enable()
+			extractEntry.Enable()
+			continueCheck.Enable()
+			addStepBtn.Enable()
+			duplicateStepBtn.Enable()
+			removeStepBtn.Enable()
 			return
 		}
 
+		stepSelect.Disable()
+		stepNameEntry.Disable()
 		methodSelect.Disable()
 		pathEntry.Disable()
 		paramsEntry.Disable()
@@ -195,10 +223,15 @@ func main() {
 		bodyEntry.Disable()
 		headersEntry.Disable()
 		matchEntry.Disable()
+		extractEntry.Disable()
+		continueCheck.Disable()
+		addStepBtn.Disable()
+		duplicateStepBtn.Disable()
+		removeStepBtn.Disable()
 	}
 
-	clearEditor := func() {
-		nameEntry.SetText("")
+	clearStepForm := func() {
+		stepNameEntry.SetText("")
 		methodSelect.ClearSelected()
 		pathEntry.SetText("")
 		paramsEntry.SetText("")
@@ -206,67 +239,184 @@ func main() {
 		bodyEntry.SetText("")
 		headersEntry.SetText("")
 		matchEntry.SetText("")
+		extractEntry.SetText("")
+		continueCheck.SetChecked(false)
 	}
 
-	setSelectedValue := func(selectWidget *widget.Select, value string) {
-		value = strings.TrimSpace(value)
-		if value == "" {
-			selectWidget.ClearSelected()
+	setStepSelectOptions := func(options []string) {
+		stepSelectionGuard = true
+		stepSelect.Options = append([]string(nil), options...)
+		stepSelect.ClearSelected()
+		stepSelect.Refresh()
+		stepSelectionGuard = false
+	}
+
+	stepOptionLabel := func(index int, step RequestStep) string {
+		name := strings.TrimSpace(step.Name)
+		if name == "" {
+			name = fmt.Sprintf("步骤 %d", index+1)
+		}
+		return fmt.Sprintf("%d. %s", index+1, name)
+	}
+
+	selectedPOC := func() *POC {
+		if currentSelectedID == "" {
+			return nil
+		}
+		node, ok := data.Nodes[currentSelectedID]
+		if !ok || node.IsGroup || node.Data == nil {
+			return nil
+		}
+		node.Data.normalize()
+		return node.Data
+	}
+
+	syncCurrentStepFromForm := func() bool {
+		poc := selectedPOC()
+		if poc == nil || currentStepIndex < 0 || currentStepIndex >= len(poc.Steps) {
+			return true
+		}
+
+		stepName := strings.TrimSpace(stepNameEntry.Text)
+		if stepName == "" {
+			stepName = fmt.Sprintf("步骤 %d", currentStepIndex+1)
+		}
+
+		step := &poc.Steps[currentStepIndex]
+		step.Name = stepName
+		step.Method = valueOr(methodSelect.Selected, "GET")
+		step.Path = strings.TrimSpace(pathEntry.Text)
+		step.Params = strings.TrimSpace(paramsEntry.Text)
+		step.BodyType = valueOr(bodyTypeSelect.Selected, "Raw")
+		step.Body = bodyEntry.Text
+		step.Headers = headersEntry.Text
+		step.MatchRule = matchEntry.Text
+		step.ExtractRules = extractEntry.Text
+		step.ContinueOnError = continueCheck.Checked
+		step.normalize(currentStepIndex)
+
+		poc.normalize()
+		return true
+	}
+
+	loadStepToForm := func(index int) {
+		poc := selectedPOC()
+		if poc == nil || index < 0 || index >= len(poc.Steps) {
+			currentStepIndex = -1
+			clearStepForm()
 			return
 		}
-		selectWidget.SetSelected(value)
+
+		stepSelectionGuard = true
+		currentStepIndex = index
+		step := poc.Steps[index]
+		stepNameEntry.SetText(step.Name)
+		methodSelect.SetSelected(step.Method)
+		pathEntry.SetText(step.Path)
+		paramsEntry.SetText(step.Params)
+		bodyTypeSelect.SetSelected(step.BodyType)
+		bodyEntry.SetText(step.Body)
+		headersEntry.SetText(step.Headers)
+		matchEntry.SetText(step.MatchRule)
+		extractEntry.SetText(step.ExtractRules)
+		continueCheck.SetChecked(step.ContinueOnError)
+		if index < len(stepSelect.Options) {
+			stepSelect.SetSelected(stepSelect.Options[index])
+		}
+		stepSelectionGuard = false
+	}
+
+	refreshStepEditor := func(selectIndex int) {
+		poc := selectedPOC()
+		if poc == nil {
+			currentStepIndex = -1
+			setStepSelectOptions(nil)
+			clearStepForm()
+			setStepFieldsEnabled(false)
+			return
+		}
+
+		options := make([]string, 0, len(poc.Steps))
+		for index, step := range poc.Steps {
+			options = append(options, stepOptionLabel(index, step))
+		}
+		setStepSelectOptions(options)
+		setStepFieldsEnabled(true)
+		if len(options) == 0 {
+			currentStepIndex = -1
+			clearStepForm()
+			return
+		}
+
+		if selectIndex < 0 || selectIndex >= len(options) {
+			selectIndex = 0
+		}
+		loadStepToForm(selectIndex)
+	}
+
+	stepSelect.OnChanged = func(selected string) {
+		if stepSelectionGuard || selected == "" {
+			return
+		}
+
+		if !syncCurrentStepFromForm() {
+			return
+		}
+
+		dotIndex := strings.Index(selected, ".")
+		if dotIndex <= 0 {
+			return
+		}
+		index, err := strconv.Atoi(strings.TrimSpace(selected[:dotIndex]))
+		if err != nil || index <= 0 {
+			return
+		}
+		loadStepToForm(index - 1)
+	}
+
+	clearEditor := func() {
+		nodeNameEntry.SetText("")
+		selectedLabel.SetText("当前未选择节点")
+		setStepSelectOptions(nil)
+		clearStepForm()
 	}
 
 	loadNodeToEditor := func(nodeID string) {
 		currentSelectedID = nodeID
 		if nodeID == "" {
-			selectedLabel.SetText("当前未选择节点")
-			nameEntry.Disable()
-			setPOCFieldsEnabled(false)
+			nodeNameEntry.Disable()
 			saveBtn.Disable()
+			setStepFieldsEnabled(false)
 			clearEditor()
 			return
 		}
 
 		node, ok := data.Nodes[nodeID]
 		if !ok {
-			selectedLabel.SetText("当前节点不存在")
-			nameEntry.Disable()
-			setPOCFieldsEnabled(false)
+			nodeNameEntry.Disable()
 			saveBtn.Disable()
+			setStepFieldsEnabled(false)
 			clearEditor()
 			return
 		}
 
 		selectedLabel.SetText(fmt.Sprintf("当前节点：%s", node.Name))
-		nameEntry.Enable()
+		nodeNameEntry.Enable()
 		saveBtn.Enable()
-		nameEntry.SetText(node.Name)
+		nodeNameEntry.SetText(node.Name)
 
 		if node.IsGroup {
-			methodSelect.ClearSelected()
-			pathEntry.SetText("")
-			paramsEntry.SetText("")
-			bodyTypeSelect.SetSelected("Raw")
-			bodyEntry.SetText("")
-			headersEntry.SetText("")
-			matchEntry.SetText("")
-			setPOCFieldsEnabled(false)
+			setStepFieldsEnabled(false)
+			setStepSelectOptions(nil)
+			clearStepForm()
 			return
 		}
 
 		if node.Data == nil {
-			node.Data = &POC{Name: node.Name, Method: "GET", Path: "/", BodyType: "Raw"}
+			node.Data = &POC{Name: node.Name, Steps: []RequestStep{defaultRequestStep("步骤 1")}}
 		}
-
-		setSelectedValue(methodSelect, node.Data.Method)
-		pathEntry.SetText(node.Data.Path)
-		paramsEntry.SetText(node.Data.Params)
-		bodyTypeSelect.SetSelected(strings.TrimSpace(defaultString(node.Data.BodyType, "Raw")))
-		bodyEntry.SetText(node.Data.Body)
-		headersEntry.SetText(node.Data.Headers)
-		matchEntry.SetText(node.Data.MatchRule)
-		setPOCFieldsEnabled(true)
+		node.Data.normalize()
+		refreshStepEditor(0)
 	}
 
 	persistData := func(successMessage string) bool {
@@ -276,7 +426,6 @@ func main() {
 			statusLabel.SetText("保存失败")
 			return false
 		}
-
 		if successMessage != "" {
 			appendLogUI("INFO", successMessage)
 			statusLabel.SetText(successMessage)
@@ -289,12 +438,10 @@ func main() {
 		if err != nil || timeoutSeconds <= 0 {
 			return RunSettings{}, 0, fmt.Errorf("超时时间必须是正整数")
 		}
-
 		concurrency, err := strconv.Atoi(strings.TrimSpace(concurrencySelect.Selected))
 		if err != nil || concurrency <= 0 {
 			return RunSettings{}, 0, fmt.Errorf("并发数无效")
 		}
-
 		return RunSettings{
 			Timeout:            time.Duration(timeoutSeconds) * time.Second,
 			InsecureSkipVerify: insecureTLSCheck.Checked,
@@ -332,6 +479,10 @@ func main() {
 			currentSummary.Err++
 		}
 		updateSummaryUI(currentSummary)
+
+		for _, stepResult := range result.StepResults {
+			appendLogUI(stepResult.Level, stepResult.Message)
+		}
 		appendLogUI(result.Level, result.Message)
 	}
 
@@ -341,16 +492,9 @@ func main() {
 		if !ok {
 			return false
 		}
-
-		if keyword == "" {
+		if keyword == "" || strings.Contains(strings.ToLower(node.Name), keyword) {
 			return true
 		}
-
-		nameMatched := strings.Contains(strings.ToLower(node.Name), keyword)
-		if nameMatched {
-			return true
-		}
-
 		if node.IsGroup {
 			for _, childID := range node.Children {
 				if matchesFilter(childID, keyword) {
@@ -379,7 +523,6 @@ func main() {
 			if !ok {
 				return nil
 			}
-
 			if keyword == "" {
 				return append([]string(nil), node.Children...)
 			}
@@ -421,11 +564,44 @@ func main() {
 		},
 	)
 	tree.OnSelected = func(id widget.TreeNodeID) {
+		if !syncCurrentStepFromForm() {
+			return
+		}
 		loadNodeToEditor(id)
 	}
 
 	filterEntry.OnChanged = func(_ string) {
 		tree.Refresh()
+	}
+
+	resolveImportParentID := func() string {
+		if currentSelectedID == "" {
+			return ""
+		}
+		node, ok := data.Nodes[currentSelectedID]
+		if !ok {
+			return ""
+		}
+		if node.IsGroup {
+			return currentSelectedID
+		}
+		return node.ParentID
+	}
+
+	appendImportedPOCs := func(parentID, folderName string, pocs []POC) error {
+		groupNode, err := data.addGroup(parentID, folderName)
+		if err != nil {
+			return err
+		}
+		for _, poc := range pocs {
+			pocCopy := poc
+			if _, err := data.addPOC(groupNode.ID, &pocCopy); err != nil {
+				return err
+			}
+		}
+		tree.Refresh()
+		tree.Select(groupNode.ID)
+		return nil
 	}
 
 	addFolderBtn := widget.NewButtonWithIcon("新建文件夹", theme.FolderNewIcon(), func() {
@@ -453,7 +629,6 @@ func main() {
 			dialog.ShowError(err, w)
 			return
 		}
-
 		tree.Refresh()
 		tree.Select(node.ID)
 		_ = persistData("已创建文件夹")
@@ -465,26 +640,15 @@ func main() {
 			return
 		}
 
-		if currentSelectedID == "" {
+		parentID := resolveImportParentID()
+		if parentID == "" {
 			dialog.ShowInformation("提示", "请先选择一个文件夹", w)
 			return
 		}
 
-		node, ok := data.Nodes[currentSelectedID]
-		if !ok {
-			dialog.ShowError(fmt.Errorf("当前节点不存在"), w)
-			return
-		}
-		if !node.IsGroup {
-			dialog.ShowInformation("提示", "请选择文件夹后再创建 POC", w)
-			return
-		}
-
-		newNode, err := data.addPOC(currentSelectedID, &POC{
-			Name:     "新建POC",
-			Method:   "GET",
-			Path:     "/",
-			BodyType: "Raw",
+		newNode, err := data.addPOC(parentID, &POC{
+			Name:  "新建POC",
+			Steps: []RequestStep{defaultRequestStep("步骤 1")},
 		})
 		if err != nil {
 			dialog.ShowError(err, w)
@@ -501,7 +665,6 @@ func main() {
 			appendLogUI("INFO", "当前正在执行验证，请等待完成后再删除节点")
 			return
 		}
-
 		if currentSelectedID == "" {
 			dialog.ShowInformation("提示", "请先选择一个节点", w)
 			return
@@ -513,29 +676,65 @@ func main() {
 			return
 		}
 
-		dialog.NewConfirm(
-			"确认删除",
-			fmt.Sprintf("确定删除“%s”及其所有子节点吗？", node.Name),
-			func(ok bool) {
-				if !ok {
-					return
-				}
-
-				if err := data.deleteNode(currentSelectedID); err != nil {
-					dialog.ShowError(err, w)
-					return
-				}
-
-				tree.UnselectAll()
-				tree.Refresh()
-				loadNodeToEditor("")
-				_ = persistData("节点已删除")
-			},
-			w,
-		).Show()
+		dialog.NewConfirm("确认删除", fmt.Sprintf("确定删除“%s”及其所有子节点吗？", node.Name), func(ok bool) {
+			if !ok {
+				return
+			}
+			if err := data.deleteNode(currentSelectedID); err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			tree.UnselectAll()
+			tree.Refresh()
+			loadNodeToEditor("")
+			_ = persistData("节点已删除")
+		}, w).Show()
 	})
 
-	exportBtn := widget.NewButtonWithIcon("导出", theme.DownloadIcon(), func() {
+	addStepBtn.OnTapped = func() {
+		if !syncCurrentStepFromForm() {
+			return
+		}
+		poc := selectedPOC()
+		if poc == nil {
+			return
+		}
+		poc.Steps = append(poc.Steps, defaultRequestStep(fmt.Sprintf("步骤 %d", len(poc.Steps)+1)))
+		poc.normalize()
+		refreshStepEditor(len(poc.Steps) - 1)
+	}
+
+	duplicateStepBtn.OnTapped = func() {
+		if !syncCurrentStepFromForm() {
+			return
+		}
+		poc := selectedPOC()
+		if poc == nil || currentStepIndex < 0 || currentStepIndex >= len(poc.Steps) {
+			return
+		}
+		clone := poc.Steps[currentStepIndex]
+		clone.Name = clone.Name + " - 副本"
+		insertAt := currentStepIndex + 1
+		poc.Steps = append(poc.Steps[:insertAt], append([]RequestStep{clone}, poc.Steps[insertAt:]...)...)
+		poc.normalize()
+		refreshStepEditor(insertAt)
+	}
+
+	removeStepBtn.OnTapped = func() {
+		poc := selectedPOC()
+		if poc == nil || currentStepIndex < 0 || currentStepIndex >= len(poc.Steps) {
+			return
+		}
+		if len(poc.Steps) == 1 {
+			dialog.ShowInformation("提示", "至少保留一个请求步骤", w)
+			return
+		}
+		poc.Steps = append(poc.Steps[:currentStepIndex], poc.Steps[currentStepIndex+1:]...)
+		poc.normalize()
+		refreshStepEditor(maxInt(0, currentStepIndex-1))
+	}
+
+	exportBtn := widget.NewButtonWithIcon("导出 JSON", theme.DownloadIcon(), func() {
 		saveDialog := dialog.NewFileSave(func(writer fyne.URIWriteCloser, err error) {
 			if err != nil {
 				dialog.ShowError(err, w)
@@ -550,15 +749,14 @@ func main() {
 				dialog.ShowError(err, w)
 				return
 			}
-
-			appendLogUI("INFO", "数据导出成功")
-			statusLabel.SetText("数据导出成功")
+			appendLogUI("INFO", "JSON 数据导出成功")
+			statusLabel.SetText("JSON 数据导出成功")
 		}, w)
 		saveDialog.SetFileName("poc_data_backup.json")
 		saveDialog.Show()
 	})
 
-	importBtn := widget.NewButtonWithIcon("导入", theme.UploadIcon(), func() {
+	importJSONBtn := widget.NewButtonWithIcon("导入 JSON", theme.UploadIcon(), func() {
 		if isRunning {
 			appendLogUI("INFO", "当前正在执行验证，请等待完成后再导入数据")
 			return
@@ -580,33 +778,64 @@ func main() {
 				return
 			}
 
-			dialog.NewConfirm(
-				"导入确认",
-				"导入会覆盖当前内存中的所有节点，是否继续？",
-				func(ok bool) {
-					if !ok {
-						return
-					}
-
-					data = importedData
-					filterEntry.SetText("")
-					tree.UnselectAll()
-					tree.Refresh()
-					loadNodeToEditor("")
-					if persistData("数据已导入并保存") {
-						statusLabel.SetText("数据已导入并保存")
-					}
-				},
-				w,
-			).Show()
+			dialog.NewConfirm("导入确认", "导入会覆盖当前内存中的所有节点，是否继续？", func(ok bool) {
+				if !ok {
+					return
+				}
+				data = importedData
+				filterEntry.SetText("")
+				tree.UnselectAll()
+				tree.Refresh()
+				loadNodeToEditor("")
+				_ = persistData("JSON 数据已导入并保存")
+			}, w).Show()
 		}, w)
 		openDialog.SetFilter(storage.NewExtensionFileFilter([]string{".json"}))
+		openDialog.Show()
+	})
+
+	importNucleiBtn := widget.NewButtonWithIcon("导入 Nuclei", theme.DownloadIcon(), func() {
+		if isRunning {
+			appendLogUI("INFO", "当前正在执行验证，请等待完成后再导入模板")
+			return
+		}
+
+		openDialog := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
+			if err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			if reader == nil {
+				return
+			}
+			defer reader.Close()
+
+			folderName, importedPOCs, err := importNucleiTemplate(reader)
+			if err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			if len(importedPOCs) == 0 {
+				dialog.ShowInformation("提示", "模板未解析出可导入的 POC", w)
+				return
+			}
+
+			if err := appendImportedPOCs(resolveImportParentID(), folderName, importedPOCs); err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			_ = persistData(fmt.Sprintf("已导入 Nuclei 模板，共 %d 个 POC", len(importedPOCs)))
+		}, w)
+		openDialog.SetFilter(storage.NewExtensionFileFilter([]string{".yaml", ".yml"}))
 		openDialog.Show()
 	})
 
 	saveBtn.OnTapped = func() {
 		if currentSelectedID == "" {
 			dialog.ShowInformation("提示", "请先选择一个节点", w)
+			return
+		}
+		if !syncCurrentStepFromForm() {
 			return
 		}
 
@@ -616,7 +845,7 @@ func main() {
 			return
 		}
 
-		nodeName := strings.TrimSpace(nameEntry.Text)
+		nodeName := strings.TrimSpace(nodeNameEntry.Text)
 		if nodeName == "" {
 			dialog.ShowInformation("提示", "节点名称不能为空", w)
 			return
@@ -630,18 +859,10 @@ func main() {
 		}
 
 		if node.Data == nil {
-			node.Data = &POC{}
+			node.Data = &POC{Name: nodeName, Steps: []RequestStep{defaultRequestStep("步骤 1")}}
 		}
-
 		node.Data.Name = nodeName
-		node.Data.Method = defaultString(methodSelect.Selected, "GET")
-		node.Data.Path = strings.TrimSpace(pathEntry.Text)
-		node.Data.Params = strings.TrimSpace(paramsEntry.Text)
-		node.Data.BodyType = defaultString(bodyTypeSelect.Selected, "Raw")
-		node.Data.Body = bodyEntry.Text
-		node.Data.Headers = headersEntry.Text
-		node.Data.MatchRule = matchEntry.Text
-
+		node.Data.normalize()
 		tree.Refresh()
 		_ = persistData("POC 已保存")
 	}
@@ -650,20 +871,18 @@ func main() {
 		if isRunning {
 			return
 		}
+		if !syncCurrentStepFromForm() {
+			return
+		}
 
 		targetBase := strings.TrimSpace(targetEntry.Text)
 		if targetBase == "" {
 			appendLogUI("ERR", "请输入目标地址")
 			return
 		}
-		if currentSelectedID == "" {
-			appendLogUI("ERR", "请先选择一个 POC 节点")
-			return
-		}
-
-		node, ok := data.Nodes[currentSelectedID]
-		if !ok || node.IsGroup || node.Data == nil {
-			appendLogUI("ERR", "请选择一个有效的 POC 节点")
+		poc := selectedPOC()
+		if poc == nil {
+			appendLogUI("ERR", "请先选择一个有效的 POC 节点")
 			return
 		}
 
@@ -673,12 +892,12 @@ func main() {
 			return
 		}
 
-		poc := clonePOC(node.Data)
-		appendLogUI("INFO", fmt.Sprintf("=== 开始单点验证：%s ===", poc.Name))
+		pocCopy := clonePOC(poc)
+		appendLogUI("INFO", fmt.Sprintf("=== 开始单点验证：%s ===", pocCopy.Name))
 		startRunUI(1, "单点验证进行中")
 
 		go func() {
-			result := runner.Run(targetBase, poc, settings)
+			result := runner.Run(targetBase, pocCopy, settings)
 			fyne.Do(func() {
 				applyResultUI(result)
 				appendLogUI("INFO", "=== 单点验证完成 ===")
@@ -689,6 +908,9 @@ func main() {
 
 	batchTestBtn.OnTapped = func() {
 		if isRunning {
+			return
+		}
+		if !syncCurrentStepFromForm() {
 			return
 		}
 
@@ -723,11 +945,7 @@ func main() {
 		startRunUI(len(targets), fmt.Sprintf("批量验证进行中（%d 条）", len(targets)))
 
 		go func() {
-			workerCount := concurrency
-			if workerCount > len(targets) {
-				workerCount = len(targets)
-			}
-
+			workerCount := minInt(concurrency, len(targets))
 			jobs := make(chan *POC)
 			results := make(chan ExploitResult)
 			var wg sync.WaitGroup
@@ -767,11 +985,11 @@ func main() {
 	}
 
 	toolBar := container.NewGridWithColumns(3, addFolderBtn, addPOCBtn, deleteBtn)
-	dataBar := container.NewGridWithColumns(2, exportBtn, importBtn)
+	dataBar := container.NewGridWithColumns(3, exportBtn, importJSONBtn, importNucleiBtn)
 
 	leftCard := widget.NewCard(
 		"POC 目录",
-		"支持按名称快速筛选",
+		"支持名称筛选与 Nuclei 模板导入",
 		container.NewBorder(
 			container.NewVBox(filterEntry, toolBar, widget.NewSeparator()),
 			container.NewVBox(widget.NewSeparator(), dataBar),
@@ -781,8 +999,16 @@ func main() {
 		),
 	)
 
-	form := widget.NewForm(
-		widget.NewFormItem("名称", nameEntry),
+	stepToolbar := container.NewGridWithColumns(4,
+		widget.NewForm(widget.NewFormItem("当前步骤", stepSelect)),
+		addStepBtn,
+		duplicateStepBtn,
+		removeStepBtn,
+	)
+
+	stepForm := widget.NewForm(
+		widget.NewFormItem("节点名称", nodeNameEntry),
+		widget.NewFormItem("步骤名称", stepNameEntry),
 		widget.NewFormItem("请求方法", methodSelect),
 		widget.NewFormItem("路径", pathEntry),
 		widget.NewFormItem("查询参数", paramsEntry),
@@ -790,14 +1016,18 @@ func main() {
 		widget.NewFormItem("Body", bodyScroll),
 		widget.NewFormItem("Headers", headersScroll),
 		widget.NewFormItem("匹配规则", matchEntry),
+		widget.NewFormItem("变量提取", extractScroll),
+		widget.NewFormItem("步骤策略", continueCheck),
 	)
 
 	editorCard := widget.NewCard(
-		"POC 编辑器",
-		"更清晰的字段分组与状态控制",
+		"链式 POC 编辑器",
+		"支持多步骤请求、变量提取与占位符替换",
 		container.NewVBox(
 			selectedLabel,
-			form,
+			stepToolbar,
+			widget.NewSeparator(),
+			stepForm,
 			container.NewHBox(layout.NewSpacer(), saveBtn),
 		),
 	)
@@ -812,7 +1042,7 @@ func main() {
 
 	logCard := widget.NewCard(
 		"运行日志",
-		"日志自动裁剪，避免长时间运行占满界面",
+		"链式步骤日志、结果汇总与自动裁剪",
 		container.NewBorder(
 			container.NewVBox(summaryGrid, progressBar, widget.NewSeparator()),
 			container.NewHBox(layout.NewSpacer(), clearLogBtn),
@@ -822,31 +1052,21 @@ func main() {
 		),
 	)
 
-	rightPanel := container.NewVSplit(
-		container.NewPadded(editorCard),
-		container.NewPadded(logCard),
-	)
-	rightPanel.SetOffset(0.56)
+	rightPanel := container.NewVSplit(container.NewPadded(editorCard), container.NewPadded(logCard))
+	rightPanel.SetOffset(0.60)
 
-	mainSplit := container.NewHSplit(
-		container.NewPadded(leftCard),
-		container.NewPadded(rightPanel),
-	)
+	mainSplit := container.NewHSplit(container.NewPadded(leftCard), container.NewPadded(rightPanel))
 	mainSplit.SetOffset(0.28)
 
 	topCard := widget.NewCard(
 		"目标与运行选项",
-		"支持超时、TLS 策略和批量并发数控制",
+		"支持超时、TLS、批量并发和链式请求验证",
 		container.NewVBox(
 			targetEntry,
 			container.NewGridWithColumns(
 				4,
-				widget.NewForm(
-					widget.NewFormItem("超时(秒)", timeoutEntry),
-				),
-				widget.NewForm(
-					widget.NewFormItem("批量并发", concurrencySelect),
-				),
+				widget.NewForm(widget.NewFormItem("超时(秒)", timeoutEntry)),
+				widget.NewForm(widget.NewFormItem("批量并发", concurrencySelect)),
 				container.NewCenter(insecureTLSCheck),
 				container.NewGridWithColumns(2, singleTestBtn, batchTestBtn),
 			),
@@ -878,6 +1098,9 @@ func main() {
 	}
 
 	w.SetCloseIntercept(func() {
+		if !syncCurrentStepFromForm() {
+			return
+		}
 		if err := saveDataToFile(dataFile, data); err != nil {
 			dialog.ShowError(err, w)
 			return
@@ -889,9 +1112,16 @@ func main() {
 	w.ShowAndRun()
 }
 
-func defaultString(value, fallback string) string {
-	if strings.TrimSpace(value) == "" {
-		return fallback
+func minInt(a, b int) int {
+	if a < b {
+		return a
 	}
-	return value
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

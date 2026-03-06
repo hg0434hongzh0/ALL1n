@@ -3,17 +3,32 @@ package main
 import (
 	"fmt"
 	"strconv"
+	"strings"
 )
 
+type RequestStep struct {
+	Name            string `json:"name"`
+	Method          string `json:"method"`
+	Path            string `json:"path"`
+	Params          string `json:"params"`
+	Body            string `json:"body"`
+	BodyType        string `json:"body_type"`
+	Headers         string `json:"headers"`
+	MatchRule       string `json:"match_rule"`
+	ExtractRules    string `json:"extract_rules,omitempty"`
+	ContinueOnError bool   `json:"continue_on_error,omitempty"`
+}
+
 type POC struct {
-	Name      string `json:"name"`
-	Method    string `json:"method"`
-	Path      string `json:"path"`
-	Params    string `json:"params"`
-	Body      string `json:"body"`
-	BodyType  string `json:"body_type"`
-	Headers   string `json:"headers"`
-	MatchRule string `json:"match_rule"`
+	Name      string        `json:"name"`
+	Method    string        `json:"method,omitempty"`
+	Path      string        `json:"path,omitempty"`
+	Params    string        `json:"params,omitempty"`
+	Body      string        `json:"body,omitempty"`
+	BodyType  string        `json:"body_type,omitempty"`
+	Headers   string        `json:"headers,omitempty"`
+	MatchRule string        `json:"match_rule,omitempty"`
+	Steps     []RequestStep `json:"steps,omitempty"`
 }
 
 type Node struct {
@@ -45,20 +60,30 @@ func defaultAppData() *appData {
 	categoryNode, _ := data.addGroup(rootNode.ID, "SQL 注入漏洞")
 
 	_, _ = data.addPOC(categoryNode.ID, &POC{
-		Name:      "KeyWord-SQL注入",
-		Method:    "POST",
-		Path:      "/service/monitorservlet",
-		Body:      "key=1' OR 1=1--",
-		BodyType:  "Form",
-		MatchRule: "SQL syntax",
+		Name: "KeyWord-SQL注入",
+		Steps: []RequestStep{
+			{
+				Name:      "注入验证",
+				Method:    "POST",
+				Path:      "/service/monitorservlet",
+				Body:      "key=1' OR 1=1--",
+				BodyType:  "Form",
+				MatchRule: "body:SQL syntax",
+			},
+		},
 	})
 
 	_, _ = data.addPOC(categoryNode.ID, &POC{
-		Name:      "Login-Bypass",
-		Method:    "GET",
-		Path:      "/admin/index.jsp",
-		Params:    "bypass=true",
-		MatchRule: "Welcome Admin",
+		Name: "Login-Bypass",
+		Steps: []RequestStep{
+			{
+				Name:      "绕过登录",
+				Method:    "GET",
+				Path:      "/admin/index.jsp",
+				Params:    "bypass=true",
+				MatchRule: "body:Welcome Admin",
+			},
+		},
 	})
 
 	return data
@@ -70,7 +95,76 @@ func clonePOC(src *POC) *POC {
 	}
 
 	copyValue := *src
+	if len(src.Steps) > 0 {
+		copyValue.Steps = append([]RequestStep(nil), src.Steps...)
+	}
+	copyValue.normalize()
 	return &copyValue
+}
+
+func defaultRequestStep(name string) RequestStep {
+	if strings.TrimSpace(name) == "" {
+		name = "步骤 1"
+	}
+	return RequestStep{
+		Name:     name,
+		Method:   "GET",
+		Path:     "/",
+		BodyType: "Raw",
+	}
+}
+
+func (step *RequestStep) normalize(index int) {
+	if step == nil {
+		return
+	}
+
+	if strings.TrimSpace(step.Name) == "" {
+		step.Name = fmt.Sprintf("步骤 %d", index+1)
+	}
+	step.Method = strings.ToUpper(strings.TrimSpace(valueOr(step.Method, "GET")))
+	step.Path = valueOr(step.Path, "/")
+	step.BodyType = valueOr(step.BodyType, "Raw")
+}
+
+func (p *POC) normalize() {
+	if p == nil {
+		return
+	}
+
+	if strings.TrimSpace(p.Name) == "" {
+		p.Name = "新建POC"
+	}
+
+	if len(p.Steps) == 0 {
+		legacyStep := defaultRequestStep("步骤 1")
+		legacyStep.Method = valueOr(strings.ToUpper(strings.TrimSpace(p.Method)), "GET")
+		legacyStep.Path = valueOr(p.Path, "/")
+		legacyStep.Params = p.Params
+		legacyStep.Body = p.Body
+		legacyStep.BodyType = valueOr(p.BodyType, "Raw")
+		legacyStep.Headers = p.Headers
+		legacyStep.MatchRule = p.MatchRule
+		p.Steps = []RequestStep{legacyStep}
+	}
+
+	for i := range p.Steps {
+		p.Steps[i].normalize(i)
+	}
+
+	firstStep := p.Steps[0]
+	p.Method = firstStep.Method
+	p.Path = firstStep.Path
+	p.Params = firstStep.Params
+	p.Body = firstStep.Body
+	p.BodyType = firstStep.BodyType
+	p.Headers = firstStep.Headers
+	p.MatchRule = firstStep.MatchRule
+}
+
+func (p *POC) normalizedSteps() []RequestStep {
+	p.normalize()
+	return append([]RequestStep(nil), p.Steps...)
 }
 
 func (d *appData) ensure() {
@@ -130,20 +224,12 @@ func (d *appData) addPOC(parentID string, poc *POC) (*Node, error) {
 	}
 
 	if poc == nil {
-		poc = &POC{}
+		poc = &POC{
+			Name:  "新建POC",
+			Steps: []RequestStep{defaultRequestStep("步骤 1")},
+		}
 	}
-	if poc.Name == "" {
-		poc.Name = "新建POC"
-	}
-	if poc.Method == "" {
-		poc.Method = "GET"
-	}
-	if poc.Path == "" {
-		poc.Path = "/"
-	}
-	if poc.BodyType == "" {
-		poc.BodyType = "Raw"
-	}
+	poc.normalize()
 
 	node := &Node{
 		ID:       d.nextID(),
@@ -267,6 +353,11 @@ func (d *appData) validate() error {
 			}
 		} else if node.Data == nil {
 			return fmt.Errorf("POC 节点 %s 缺少数据", id)
+		} else {
+			node.Data.normalize()
+			if len(node.Data.Steps) == 0 {
+				return fmt.Errorf("POC 节点 %s 缺少请求步骤", id)
+			}
 		}
 
 		if node.ParentID == "" {
@@ -354,4 +445,11 @@ func containsString(items []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func valueOr(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
 }
