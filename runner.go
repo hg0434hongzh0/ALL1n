@@ -3,15 +3,18 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/textproto"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
+
+const maxResponseBodyBytes int64 = 4 * 1024 * 1024
 
 type RunSettings struct {
 	Timeout            time.Duration
@@ -19,14 +22,19 @@ type RunSettings struct {
 }
 
 type ExploitResult struct {
-	POCName    string
-	Method     string
-	Path       string
-	URL        string
-	StatusCode int
-	Duration   time.Duration
-	Level      string
-	Message    string
+	Target       string               `json:"target"`
+	POCName      string               `json:"poc_name"`
+	Method       string               `json:"method"`
+	Path         string               `json:"path"`
+	URL          string               `json:"url"`
+	StatusCode   int                  `json:"status_code"`
+	Duration     time.Duration        `json:"duration"`
+	Level        string               `json:"level"`
+	Message      string               `json:"message"`
+	TestedAt     time.Time            `json:"tested_at"`
+	ResponseSize int64                `json:"response_size"`
+	Truncated    bool                 `json:"response_truncated"`
+	Evidence     *HTTPExploitEvidence `json:"evidence,omitempty"`
 }
 
 type Runner struct {
@@ -35,9 +43,9 @@ type Runner struct {
 }
 
 func NewRunner() *Runner {
-	secureTransport := http.DefaultTransport.(*http.Transport).Clone()
-	insecureTransport := http.DefaultTransport.(*http.Transport).Clone()
-	insecureTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	secureTransport := newHTTPTransport()
+	insecureTransport := newHTTPTransport()
+	insecureTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // #nosec G402 -- controlled by an explicit UI option for authorized testing.
 
 	return &Runner{
 		secureClient:   &http.Client{Transport: secureTransport},
@@ -45,11 +53,58 @@ func NewRunner() *Runner {
 	}
 }
 
+func newHTTPTransport() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = 100
+	transport.MaxIdleConnsPerHost = 20
+	transport.IdleConnTimeout = 90 * time.Second
+	return transport
+}
+
+func (r *Runner) CloseIdleConnections() {
+	if r == nil {
+		return
+	}
+	if r.secureClient != nil {
+		r.secureClient.CloseIdleConnections()
+	}
+	if r.insecureClient != nil {
+		r.insecureClient.CloseIdleConnections()
+	}
+}
+
 func (r *Runner) Run(targetBase string, poc *POC, settings RunSettings) ExploitResult {
-	result := ExploitResult{}
+	return r.RunContext(context.Background(), targetBase, poc, settings)
+}
+
+func (r *Runner) RunContext(parent context.Context, targetBase string, poc *POC, settings RunSettings) (result ExploitResult) {
+	result = ExploitResult{Target: strings.TrimSpace(targetBase), TestedAt: time.Now()}
+	defer func() {
+		result = sanitizeResultsForExport([]ExploitResult{result})[0]
+	}()
 	if poc == nil {
 		result.Level = "ERR"
 		result.Message = "POC 数据为空"
+		return result
+	}
+	if r == nil || r.secureClient == nil || r.insecureClient == nil {
+		result.Level = "ERR"
+		result.Message = "HTTP 执行器未初始化"
+		return result
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	if err := parent.Err(); err != nil {
+		result.POCName = poc.Name
+		result.Level = "CANCEL"
+		result.Message = fmt.Sprintf("[%s] 验证已取消", poc.Name)
+		return result
+	}
+	if err := validatePOC(poc); err != nil {
+		result.POCName = poc.Name
+		result.Level = "ERR"
+		result.Message = fmt.Sprintf("[%s] POC 配置无效: %v", poc.Name, err)
 		return result
 	}
 
@@ -72,13 +127,16 @@ func (r *Runner) Run(targetBase string, poc *POC, settings RunSettings) ExploitR
 		return result
 	}
 	result.URL = fullURL
+	result.Target, _ = buildTargetURL(targetBase, "", "")
 
 	var bodyReader io.Reader
-	if result.Method != http.MethodGet && strings.TrimSpace(poc.Body) != "" {
-		bodyReader = strings.NewReader(poc.Body)
+	requestBody := ""
+	if result.Method != http.MethodGet && result.Method != http.MethodHead && strings.TrimSpace(poc.Body) != "" {
+		requestBody = poc.Body
+		bodyReader = strings.NewReader(requestBody)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), settings.Timeout)
+	ctx, cancel := context.WithTimeout(parent, settings.Timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, result.Method, fullURL, bodyReader)
@@ -89,6 +147,7 @@ func (r *Runner) Run(targetBase string, poc *POC, settings RunSettings) ExploitR
 	}
 
 	applyHeaders(req, poc)
+	result.Evidence = captureRequestEvidence(req, requestBody)
 
 	client := r.secureClient
 	if settings.InsecureSkipVerify {
@@ -97,41 +156,142 @@ func (r *Runner) Run(targetBase string, poc *POC, settings RunSettings) ExploitR
 
 	resp, err := client.Do(req)
 	if err != nil {
-		result.Level = "ERR"
 		result.Duration = time.Since(startedAt)
-		result.Message = fmt.Sprintf("[%s] 请求失败: %v", poc.Name, err)
+		switch {
+		case errors.Is(err, context.Canceled):
+			result.Level = "CANCEL"
+			result.Message = fmt.Sprintf("[%s] 验证已取消", poc.Name)
+		case errors.Is(err, context.DeadlineExceeded):
+			matched, reason, matchErr := evaluateMatchContext(nil, "", poc.MatchRule, result.Duration, true)
+			if result.Evidence != nil {
+				result.Evidence.MatchEvidence = reason
+			}
+			if matchErr != nil {
+				result.Level = "ERR"
+				result.Message = fmt.Sprintf("[%s] 匹配规则错误: %v", poc.Name, matchErr)
+			} else if matched {
+				result.Level = "VULN"
+				result.Message = fmt.Sprintf("POC 判定成立：请求达到预期超时条件（%s）", result.Duration.Round(time.Millisecond))
+			} else {
+				result.Level = "ERR"
+				result.Message = fmt.Sprintf("[%s] 请求在 %s 后超时；规则未将本次超时判定为命中", poc.Name, settings.Timeout)
+			}
+		default:
+			result.Level = "ERR"
+			result.Message = fmt.Sprintf("[%s] 请求失败: %v", poc.Name, err)
+		}
 		return result
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes+1))
 	if err != nil {
+		result.Evidence = captureResponseEvidence(result.Evidence, resp, respBody, false)
 		result.Level = "ERR"
 		result.Duration = time.Since(startedAt)
 		result.Message = fmt.Sprintf("[%s] 读取响应失败: %v", poc.Name, err)
 		return result
 	}
+	result.ResponseSize = int64(len(respBody))
+	if result.ResponseSize > maxResponseBodyBytes {
+		result.Truncated = true
+		result.ResponseSize = maxResponseBodyBytes
+		respBody = respBody[:maxResponseBodyBytes]
+	}
+	result.Evidence = captureResponseEvidence(result.Evidence, resp, respBody, result.Truncated)
 
 	result.StatusCode = resp.StatusCode
 	result.Duration = time.Since(startedAt)
 
-	matched, reason, err := evaluateMatch(resp, string(respBody), poc.MatchRule)
+	matched, reason, err := evaluateMatchContext(resp, string(respBody), poc.MatchRule, result.Duration, false)
 	if err != nil {
+		if result.Evidence != nil {
+			result.Evidence.MatchEvidence = "匹配规则错误: " + err.Error()
+		}
 		result.Level = "ERR"
 		result.Message = fmt.Sprintf("[%s] 匹配规则错误: %v", poc.Name, err)
 		return result
 	}
 
+	if result.Evidence != nil {
+		result.Evidence.MatchEvidence = reason
+	}
 	durationText := result.Duration.Round(time.Millisecond).String()
+	responseNote := ""
+	if result.Truncated {
+		responseNote = fmt.Sprintf("，响应超过 %s，仅分析前 %s", formatBytes(maxResponseBodyBytes), formatBytes(maxResponseBodyBytes))
+	}
 	if matched {
 		result.Level = "VULN"
-		result.Message = fmt.Sprintf("[+] %s 命中规则（%s） [HTTP %d, %s]", poc.Name, reason, resp.StatusCode, durationText)
+		result.Message = fmt.Sprintf("POC 判定成立：匹配规则满足，目标呈现对应漏洞特征 [HTTP %d · %s%s]", resp.StatusCode, durationText, responseNote)
 		return result
 	}
 
 	result.Level = "SAFE"
-	result.Message = fmt.Sprintf("[-] %s 未命中规则（%s） [HTTP %d, %s]", poc.Name, reason, resp.StatusCode, durationText)
+	result.Message = fmt.Sprintf("POC 未命中：匹配规则未满足 [HTTP %d · %s%s]", resp.StatusCode, durationText, responseNote)
 	return result
+}
+
+func formatBytes(size int64) string {
+	const unit = int64(1024)
+	if size < unit {
+		return fmt.Sprintf("%d B", size)
+	}
+	div, exp := unit, 0
+	for value := size / unit; value >= unit && exp < 5; value /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(size)/float64(div), "KMGTPE"[exp])
+}
+
+func validatePOC(poc *POC) error {
+	if poc == nil {
+		return fmt.Errorf("POC 数据为空")
+	}
+	method := strings.ToUpper(strings.TrimSpace(poc.Method))
+	if method == "" {
+		method = http.MethodGet
+	}
+	if !supportedRequestMethod(method) {
+		return fmt.Errorf("不支持的请求方法 %q", method)
+	}
+
+	for lineNumber, line := range strings.Split(poc.Headers, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			return fmt.Errorf("Header 第 %d 行缺少冒号", lineNumber+1)
+		}
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		if key == "" || textproto.CanonicalMIMEHeaderKey(key) == "" {
+			return fmt.Errorf("Header 第 %d 行名称无效", lineNumber+1)
+		}
+		if strings.ContainsAny(value, "\r\n") {
+			return fmt.Errorf("Header 第 %d 行值包含换行符", lineNumber+1)
+		}
+	}
+
+	return validateMatchRule(poc.MatchRule)
+}
+
+func validateMatchRule(rule string) error {
+	expression, err := parseMatchExpression(rule)
+	if err != nil {
+		return err
+	}
+	for _, group := range expression.groups {
+		for _, condition := range group {
+			if err := validateMatchCondition(condition); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func buildTargetURL(targetBase, pocPath, rawParams string) (string, error) {
@@ -146,6 +306,12 @@ func buildTargetURL(targetBase, pocPath, rawParams string) (string, error) {
 	parsedURL, err := url.Parse(base)
 	if err != nil {
 		return "", err
+	}
+	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
+		return "", fmt.Errorf("仅支持 http 或 https 地址")
+	}
+	if parsedURL.Host == "" {
+		return "", fmt.Errorf("目标地址缺少主机名")
 	}
 
 	cleanPath := strings.TrimSpace(pocPath)
@@ -181,15 +347,15 @@ func applyHeaders(req *http.Request, poc *POC) {
 
 	switch strings.ToUpper(strings.TrimSpace(poc.Method)) {
 	case http.MethodPost, http.MethodPut, http.MethodPatch:
-		switch strings.TrimSpace(poc.BodyType) {
+		switch strings.ToUpper(strings.TrimSpace(poc.BodyType)) {
 		case "JSON":
 			req.Header.Set("Content-Type", "application/json")
-		case "Form":
+		case "FORM":
 			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		}
 	}
 
-	req.Header.Set("User-Agent", "ALL1n-POC-Workbench/2.0")
+	req.Header.Set("User-Agent", "ALL1n-POC-Workbench/"+appVersion)
 
 	lines := strings.Split(poc.Headers, "\n")
 	for _, line := range lines {
@@ -212,73 +378,22 @@ func applyHeaders(req *http.Request, poc *POC) {
 }
 
 func evaluateMatch(resp *http.Response, body, rule string) (bool, string, error) {
-	trimmedRule := strings.TrimSpace(rule)
-	if trimmedRule == "" {
+	return evaluateMatchContext(resp, body, rule, 0, false)
+}
+
+func evaluateMatchContext(resp *http.Response, body, rule string, duration time.Duration, timedOut bool) (bool, string, error) {
+	if strings.TrimSpace(rule) == "" {
 		return false, "未配置匹配规则", nil
 	}
-
-	expressions := strings.Split(trimmedRule, "&&")
-	reasons := make([]string, 0, len(expressions))
-
-	for _, expression := range expressions {
-		expression = strings.TrimSpace(expression)
-		if expression == "" {
-			continue
-		}
-
-		lowerExpr := strings.ToLower(expression)
-		switch {
-		case strings.HasPrefix(lowerExpr, "status:"):
-			ok, reason, err := matchStatus(resp.StatusCode, strings.TrimSpace(expression[len("status:"):]))
-			if err != nil {
-				return false, "", err
-			}
-			if !ok {
-				return false, reason, nil
-			}
-			reasons = append(reasons, reason)
-
-		case strings.HasPrefix(lowerExpr, "header:"):
-			ok, reason, err := matchHeader(resp, strings.TrimSpace(expression[len("header:"):]))
-			if err != nil {
-				return false, "", err
-			}
-			if !ok {
-				return false, reason, nil
-			}
-			reasons = append(reasons, reason)
-
-		case strings.HasPrefix(lowerExpr, "body:"):
-			needle := strings.TrimSpace(expression[len("body:"):])
-			if !strings.Contains(body, needle) {
-				return false, fmt.Sprintf("正文不包含 %q", needle), nil
-			}
-			reasons = append(reasons, fmt.Sprintf("body 包含 %q", needle))
-
-		case strings.HasPrefix(lowerExpr, "regex:"):
-			pattern := strings.TrimSpace(expression[len("regex:"):])
-			matcher, err := regexp.Compile(pattern)
-			if err != nil {
-				return false, "", err
-			}
-			if !matcher.MatchString(body) {
-				return false, fmt.Sprintf("正则 %q 未命中", pattern), nil
-			}
-			reasons = append(reasons, fmt.Sprintf("regex %q", pattern))
-
-		default:
-			if !strings.Contains(body, expression) {
-				return false, fmt.Sprintf("正文不包含 %q", expression), nil
-			}
-			reasons = append(reasons, fmt.Sprintf("正文包含 %q", expression))
-		}
+	if resp == nil && !timedOut {
+		return false, "", fmt.Errorf("响应对象为空")
 	}
 
-	if len(reasons) == 0 {
-		return false, "未配置有效匹配规则", nil
+	expression, err := parseMatchExpression(rule)
+	if err != nil {
+		return false, "", err
 	}
-
-	return true, strings.Join(reasons, " && "), nil
+	return expression.evaluate(matchContext{response: resp, body: body, duration: duration, timedOut: timedOut})
 }
 
 func matchStatus(statusCode int, rawRule string) (bool, string, error) {
@@ -292,6 +407,9 @@ func matchStatus(statusCode int, rawRule string) (bool, string, error) {
 		if err != nil {
 			return false, "", err
 		}
+		if prefix < 1 || prefix > 5 {
+			return false, "", fmt.Errorf("status 类别必须是 1xx 到 5xx")
+		}
 		if statusCode/100 == prefix {
 			return true, fmt.Sprintf("status 属于 %s", strings.ToUpper(rule)), nil
 		}
@@ -300,17 +418,16 @@ func matchStatus(statusCode int, rawRule string) (bool, string, error) {
 
 	if strings.Contains(rule, "-") {
 		parts := strings.SplitN(rule, "-", 2)
-		if len(parts) != 2 {
-			return false, "", fmt.Errorf("status 范围规则无效: %s", rawRule)
-		}
-
 		start, err := strconv.Atoi(strings.TrimSpace(parts[0]))
 		if err != nil {
-			return false, "", err
+			return false, "", fmt.Errorf("无效的 status 范围起始值: %w", err)
 		}
 		end, err := strconv.Atoi(strings.TrimSpace(parts[1]))
 		if err != nil {
-			return false, "", err
+			return false, "", fmt.Errorf("无效的 status 范围结束值: %w", err)
+		}
+		if start < 100 || end > 599 || start > end {
+			return false, "", fmt.Errorf("status 范围必须在 100-599 且起始值不大于结束值")
 		}
 
 		if statusCode >= start && statusCode <= end {
@@ -322,6 +439,9 @@ func matchStatus(statusCode int, rawRule string) (bool, string, error) {
 	expectedStatus, err := strconv.Atoi(rule)
 	if err != nil {
 		return false, "", err
+	}
+	if expectedStatus < 100 || expectedStatus > 599 {
+		return false, "", fmt.Errorf("status 必须在 100-599")
 	}
 	if statusCode == expectedStatus {
 		return true, fmt.Sprintf("status 等于 %d", expectedStatus), nil

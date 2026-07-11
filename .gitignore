@@ -1,0 +1,5 @@
+/bin/
+/*.exe
+poc_data.json
+poc_data.json.*
+/dist/
