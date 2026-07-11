@@ -167,12 +167,21 @@ bin\ALL1n.exe
 .\package.ps1
 ```
 
-发布产物位于：
+本地 `package.ps1` 生成 Windows 发布包；推送版本标签后，GitHub Actions 会自动生成完整多平台 Release：
 
 ```text
-dist\ALL1n-3.5.0-windows-amd64.zip
-dist\ALL1n-3.5.0-windows-amd64.zip.sha256
+ALL1n-3.5.0-windows-amd64.zip
+ALL1n-3.5.0-windows-amd64.zip.sha256
+ALL1n-3.5.0-macos-amd64.zip
+ALL1n-3.5.0-macos-amd64.zip.sha256
+ALL1n-3.5.0-macos-arm64.zip
+ALL1n-3.5.0-macos-arm64.zip.sha256
 ```
+
+- Windows：64 位 Intel / AMD 处理器
+- macOS Intel：`macos-amd64`
+- macOS Apple Silicon：`macos-arm64`，适用于 M1 / M2 / M3 / M4 系列
+- macOS 包内提供标准 `ALL1n.app`，并进行 ad-hoc 签名；公开构建未使用 Apple Developer 证书公证，首次打开时可能需要在“系统设置 → 隐私与安全性”中确认。
 
 ## 通用 Go 命令
 
